@@ -1,8 +1,6 @@
 # Lua Whitedb
 
 Lua whitedb module
-
-# Description
 Lua module for portable whitedb inmemory nosql library
 
 
