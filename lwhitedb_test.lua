@@ -1,13 +1,15 @@
 print('Whitedb test begin')
 print( '--------------------------------')
-local whitedb = require 'whitedb'
+require 'minibackend'
+local whitedb = whitedb
 
 -- check whitedb
 	if whitedb == nil then print( 'Whitedb is nil') return end
 -- check whitedb attach
 	if whitedb.attach == nil then print( 'Whitedb attach is nil') return end
 
-local db = whitedb.attach( 'test', 1024*1024, 0 )
+    --5368709120
+local db = whitedb.attach( 'test', 1000000 , 0 )
 
 -- new whitedb
 	if db == nil then print( 'Whitedb new db is nil') return end
@@ -20,7 +22,7 @@ local rec2count = 4
 local rec1 = db:create( rec1count  )
 local rec2 = db:create( rec2count  )
 local rec3 = db:create( rec2count  )
-
+local rec4 = db:create( rec2count  )
 print( ' record 1 created : ' .. rec1count )
 print( ' record 2 created : ' .. rec2count )
 
@@ -36,6 +38,10 @@ rec1:set( 2, 1 )
 rec1:set( 3, 3 )
 rec1:set( 4, 1 )
 
+print( ' Set record 1 field 2 ref to rec 4')
+print( '--------------------------------')
+rec1:rec_ref( 2, rec4 )
+db:print()
 
 print( ' Set record 2 fields')
 print( '--------------------------------')
@@ -180,5 +186,9 @@ print( '--------------------------------')
 db:export_csv( 'c:\\temp\\db.csv' )
 
 print('\n')
+print( 'Clear database')
+print( '--------------------------------')
+db:clear()
+db:print()
 
 print('Whitedb test end')
