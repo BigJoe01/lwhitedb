@@ -5,8 +5,8 @@
 **
 **/
 
-#include "lua.h"
-#include "lauxlib.h"
+#include <lua.h>
+#include <lauxlib.h>
 
 #include "dbapi.h"
 #include "indexapi.h" 
@@ -15,69 +15,19 @@
 #include <string.h>
 #include <assert.h>
 
-#define  WHITEDB_ITARATOR_METATABLE "whitedb_iterator_meta_table"
 #define  WHITEDB_METATABLE          "whitedb_meta_table"
 #define  WHITEDB_RECORD_METATABLE   "whitedb_record_meta_table"
 #define  WHITEDB_NAME               "whitedb"
-
-#if LUA_VERSION_NUM < 502
-	#define luaL_newlib(L,l) (lua_newtable(L), luaL_register(L,NULL,l))
-#endif
+#define  WHITEDB_MAX_FIND_STR_SIZE  64
 
 #define DWhiteDbNameSize 64
+#define DWhiteDbMaxMultiIndexSize 16
+#define DWhiteDbMaxQuerySize 20
+
+#define DWhiteDbVersion "0.1.1"
 
 static int whitedb_record_metatable_ref;
 static int whitedb_metatable_ref;
-static int whitedb_record_iterator_ref;
-
-
-
-//WG_COND_EQUAL       =
-//WG_COND_NOT_EQUAL   !=
-//WG_COND_LESSTHAN    <
-//WG_COND_GREATER     >
-//WG_COND_LTEQUAL     <=
-//WG_COND_GTEQUAL     >=
-
-
-// Field Types
-// WG_NULLTYPE 1
-// WG_RECORDTYPE 2
-// WG_INTTYPE 3
-// WG_DOUBLETYPE 4
-// WG_STRTYPE 5
-// WG_XMLLITERALTYPE 6
-// WG_URITYPE 7
-// WG_BLOBTYPE 8
-// WG_CHARTYPE 9
-// WG_FIXPOINTTYPE 10
-// WG_DATETYPE 11
-// WG_TIMETYPE 12
-
-/** Update contents of one field
-*  returns 0 if successful
-*  returns -1 if invalid db pointer passed (by recordcheck macro)
-*  returns -2 if invalid record passed (by recordcheck macro)
-*  returns -3 for fatal index error
-*  returns -4 for backlink-related error
-*  returns -5 for invalid external data
-*  returns -6 for journal error
-
-** Atomic errors
-
--1 if wrong db pointer
--2 if wrong fieldnr
--10 if new value non-immediate
--11 if old value non-immediate
--12 if cannot fetch old data
--13 if the field has an index
--14 if logging is active
--15 if the field value has been changed from old_data
--16 if the result of the addition does not fit into a smallint
--17 if atomic assignment failed after a large numbe
-
-
-*/
 
 //---------------------------------------------------------
 // iterator modes
@@ -86,29 +36,49 @@ static int whitedb_record_iterator_ref;
 
 typedef struct whitedb_record_iterator
 {
-	void* whitedb;
-	void* record;
-	void* parent;
-	int   mode;
+	void* pWhiteDb;
+	void* pRecord;
+	void* pParent;
+	int   iMode;
 } whitedb_record_iterator;
+
+//---------------------------------------------------------
+typedef struct whitedb_find_iterator
+{
+	void* pWhiteDb;
+	void* pRecord;
+	int   iFieldIndex;
+	int   iFieldType;
+	int   iFiendCond;
+	double dValue;
+	int    bValue;
+	char   sValue[WHITEDB_MAX_FIND_STR_SIZE + 1];
+} whitedb_find_iterator;
+
 
 //---------------------------------------------------------
 typedef struct whitedb_instance
 {
-	void* whitedb;
-	int   mode;
-	int   permissions;
-	char  name[DWhiteDbNameSize + 1];
+	void* pWhiteDb;
+	int   iMode;
+	int   iPermissions;
+	char  sName[DWhiteDbNameSize + 1];
 } whitedb_instance;
 
 //---------------------------------------------------------
 typedef struct whitedb_record
 {
-	void* whitedb;
-	void* record;
-	wg_int error;
-	//int   size;
+	void* pWhiteDb;
+	void* pRecord;
+	wg_int iError;
 } whitedb_record;
+
+//---------------------------------------------------------
+typedef struct whitedb_query_iterator
+{
+	void*     pWhiteDb;
+	wg_query* pQuery;
+} whitedb_query_iterator;
 
 //---------------------------------------------------------
 static whitedb_instance* check_instance(lua_State *l, int iIndex)
@@ -120,112 +90,139 @@ static whitedb_instance* check_instance(lua_State *l, int iIndex)
 	whitedb_instance* instance = (whitedb_instance*)lua_touserdata(l, iIndex);
 #endif
 	assert(instance);
+	return instance;
 }
-
+//---------------------------------------------------------
 #define INSTANCE_EXIT_BOOL(NAME) if ( !NAME ) { lua_pushboolean(l, 0 ); return 1; }
 #define INSTANCE_EXIT_NIL(NAME) if ( !NAME ) { lua_pushnil(l); return 1; }
 
 //---------------------------------------------------------
-static int whitedb_record_gc(lua_State *l)
+static const char* STR_COND_EQUAL = "=";
+static const char* STR_COND_NOT_EQUAL = "!=";
+static const char* STR_COND_LESSTHAN = "<";
+static const char* STR_COND_GREATER = ">";
+static const char* STR_COND_LTEQUAL = "<=";
+static const char* STR_COND_GTEQUAL = ">=";
+
+//---------------------------------------------------------
+const char* cond_to_str(int iCondition)
 {
-	whitedb_record* record = lua_touserdata(l, 1);
-	assert(record);
-	free(record);
+	switch (iCondition)
+	{
+		case WG_COND_EQUAL: return STR_COND_EQUAL;
+		case WG_COND_NOT_EQUAL: return STR_COND_NOT_EQUAL;
+		case WG_COND_LESSTHAN: return STR_COND_LESSTHAN;
+		case WG_COND_GREATER: return STR_COND_GREATER;
+		case WG_COND_LTEQUAL: return STR_COND_LTEQUAL;
+		case WG_COND_GTEQUAL: return STR_COND_GTEQUAL;
+		default:
+			assert(0);
+			break;
+	}
+	return NULL;
 }
 
 //---------------------------------------------------------
-static int whitedb_record_to_state(void* whitedb, void* dbrecord, int size,  lua_State *l )
+int str_to_cond(const char* sCondition)
 {
-	assert(whitedb);
-	void* record = dbrecord == NULL ? wg_create_record( whitedb, size) : dbrecord;
-	if (record == NULL)
+	if ( strcmp(sCondition, STR_COND_EQUAL) == 0)
+		return WG_COND_EQUAL;
+
+	if (strcmp(sCondition, STR_COND_NOT_EQUAL) == 0)
+		return WG_COND_NOT_EQUAL;
+
+	if (strcmp(sCondition, STR_COND_LESSTHAN) == 0)
+		return WG_COND_LESSTHAN;
+
+	if (strcmp(sCondition, STR_COND_GREATER) == 0)
+		return WG_COND_GREATER;
+
+	if (strcmp(sCondition, STR_COND_LTEQUAL) == 0)
+		return WG_COND_LTEQUAL;
+
+	if (strcmp(sCondition, STR_COND_GTEQUAL) == 0)
+		return WG_COND_GTEQUAL;
+	
+	assert(0);
+	return 0;
+}
+
+//---------------------------------------------------------
+static int whitedb_record_to_userdata(void* pWhiteDb, void* pRecord, int iSize,  lua_State *l )
+{
+	assert(pWhiteDb);
+	void* pIntRecord = pRecord == NULL ? wg_create_record(pWhiteDb, iSize) : pRecord;
+	if ( pIntRecord == NULL)
 	{
 		lua_pushnil(l);
 		return 1;
 	}
 
-	whitedb_record* pRecord = lua_newuserdata(l, sizeof(whitedb_record));
-	pRecord->record = record;
-	pRecord->whitedb = whitedb;
+	whitedb_record* pNewIntRecord = lua_newuserdata(l, sizeof(whitedb_record));
+	pNewIntRecord->pRecord  = pIntRecord;
+	pNewIntRecord->pWhiteDb = pWhiteDb;
 	lua_rawgeti(l, LUA_REGISTRYINDEX, whitedb_record_metatable_ref );
 	lua_setmetatable(l, -2);
 	return 1;
 }
 
-
 //---------------------------------------------------------
-static void whitedb_add_record_to_state(lua_State *l, void* whitedb, void* record )
+static int whitedb_record_createxx(lua_State *l)
 {
-	whitedb_record* pRecord = lua_newuserdata(l, sizeof(whitedb_record));
-	pRecord->record = record;
-	pRecord->whitedb = whitedb;
-	lua_rawgeti(l, LUA_REGISTRYINDEX, whitedb_record_metatable_ref);
-	lua_setmetatable(l, -2);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	assert(pRecord);
+	int iSize = 1;
+	if (lua_gettop(l) > 1)
+		iSize = lua_tointeger(l, 2);
+	return whitedb_record_to_userdata( pRecord->pWhiteDb, NULL, iSize, l);
 }
 
 //---------------------------------------------------------
 static int whitedb_record_create(lua_State *l)
 {
-	whitedb_record* record = lua_touserdata(l, 1);
-	assert(record);
-	int               size = 1;
-	if (lua_gettop(l) > 1)
-		size = lua_tointeger(l, 2);
-	return whitedb_record_to_state( record->whitedb, NULL, size, l);
-}
+	assert(lua_gettop(l) > 0);
 
-//---------------------------------------------------------
-static int whitedb_record_create2(lua_State *l)
-{
-	whitedb_instance* instance = lua_touserdata(l, 1);
-	int               size = 1;
+	whitedb_instance* pInstance = lua_touserdata(l, 1);
+	int               iSize = 1;
 	if ( lua_gettop(l) > 1 )
-		size = lua_tointeger(l, 2);
+		iSize = lua_tointeger(l, 2);
 
-	assert(instance);
-	assert(instance->whitedb);
-	return whitedb_record_to_state(instance->whitedb, NULL, size, l);
+	assert(pInstance);
+	assert(pInstance->pWhiteDb);
+	return whitedb_record_to_userdata(pInstance->pWhiteDb, NULL, iSize, l);
 }
 
 //---------------------------------------------------------
 static int whitedb_record_delete(lua_State *l)
 {
-	whitedb_record* record = lua_touserdata(l, 1);
-	assert(record);
-
-	wg_int iSuccess = wg_delete_record(record->whitedb, record->record);
+	assert(lua_gettop(l) > 0);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	assert(pRecord);
+	wg_int iSuccess = wg_delete_record(pRecord->pWhiteDb, pRecord->pRecord);
 	lua_pushboolean( l, iSuccess == 0);
-	lua_pushinteger(l, iSuccess);
+	lua_pushinteger( l, iSuccess);
 	return 2;
 }
 
 //---------------------------------------------------------
-static int whitedb_record_iterator_gc(lua_State *l)
-{
-	whitedb_record_iterator* iterator = (whitedb_record_iterator*)lua_touserdata(l, 1);
-	free(iterator);
-}
-
-
-//---------------------------------------------------------
 static int whitedb_records_iterator(lua_State *l)
 {		
-	whitedb_record_iterator* iterator = (whitedb_record_iterator*)lua_touserdata(l, lua_upvalueindex(1));
-	void*  next = NULL;
+	whitedb_record_iterator* pIterator = (whitedb_record_iterator*)lua_touserdata(l, lua_upvalueindex(1));
+	void*  pNext = NULL;
 
-	if (iterator->mode == 1)
+	if (pIterator->iMode == 1)
 	{
-		if (iterator->record)
-			next = wg_get_next_record(iterator->whitedb, iterator->record);
+		if (pIterator->pRecord)
+			pNext = wg_get_next_record(pIterator->pWhiteDb, pIterator->pRecord);
 		else
-			next = wg_get_first_record(iterator->whitedb);
+			pNext = wg_get_first_record(pIterator->pWhiteDb);
 	}
-	else if (iterator->mode == 2)
+	else if (pIterator->iMode == 2)
 	{
-		if (iterator->parent)
-			next = wg_get_next_parent(iterator->whitedb, iterator->record, iterator->parent);
+		if (pIterator->pParent)
+			pNext = wg_get_next_parent(pIterator->pWhiteDb, pIterator->pRecord, pIterator->pParent);
 		else
-			next = wg_get_first_parent(iterator->whitedb, iterator->record );
+			pNext = wg_get_first_parent(pIterator->pWhiteDb, pIterator->pRecord );
 	}
 	else
 	{
@@ -233,17 +230,17 @@ static int whitedb_records_iterator(lua_State *l)
 	}
 
 
-	if (next)
+	if (pNext)
 	{
-		if (iterator->mode == 1)
+		if (pIterator->iMode == 1)
 		{
-			iterator->record = next;
-			whitedb_add_record_to_state(l, iterator->whitedb, next );
+			pIterator->pRecord = pNext;
+			whitedb_record_to_userdata(pIterator->pWhiteDb, pNext, 0, l );
 		}
-		else if (iterator->mode == 2)
+		else if (pIterator->iMode == 2)
 		{
-			iterator->parent = next;
-			whitedb_add_record_to_state(l, iterator->whitedb, next);
+			pIterator->pParent = pNext;
+			whitedb_record_to_userdata(pIterator->pWhiteDb, pNext, 0, l );
 		}
 		else
 		{
@@ -255,19 +252,73 @@ static int whitedb_records_iterator(lua_State *l)
 }
 
 //---------------------------------------------------------
+static int whitedb_import_csv(lua_State *l)
+{
+	assert(lua_gettop(l) > 1 );
+	whitedb_instance* pInstance = lua_touserdata(l, 1);
+	assert(pInstance);
+	wg_int iResult = wg_import_db_csv(pInstance->pWhiteDb, (char*) lua_tostring(l, 2));
+	lua_pushboolean(l, iResult == 0 ? 1 : 0 );
+	return 1;
+}
+
+//---------------------------------------------------------
+static int whitedb_export_csv(lua_State *l)
+{
+	assert(lua_gettop(l) > 1);
+	whitedb_instance* pInstance = lua_touserdata(l, 1);
+	assert(pInstance);
+	wg_export_db_csv(pInstance->pWhiteDb, (char*)lua_tostring(l, 2));
+	lua_pushboolean(l, 1 );
+	return 1;
+}
+
+//---------------------------------------------------------
+static int whitedb_print(lua_State *l)
+{
+	assert(lua_gettop(l) > 0);
+	whitedb_instance* pInstance = lua_touserdata(l, 1);
+	assert(pInstance);
+	wg_print_db(pInstance->pWhiteDb);
+	return 0;
+}
+//---------------------------------------------------------
+static int whitedb_clear(lua_State *l)
+{
+	assert(lua_gettop(l) > 0);
+	whitedb_instance* pInstance = lua_touserdata(l, 1);
+	assert(pInstance);
+	
+	void* wg_record = wg_get_first_record(pInstance->pWhiteDb);
+	wg_int status = 0;
+	
+	while ( wg_record )
+	{
+		status = wg_delete_record(pInstance->pWhiteDb, wg_record );
+		if (status != 0 && status != -1)
+		{
+#ifdef _DEBUG
+			luaL_error(l, "");
+#endif
+			return 0;
+		}
+
+		wg_record = wg_get_next_record(pInstance->pWhiteDb, wg_record );
+	}
+	return 0;
+}
+//---------------------------------------------------------
 static int whitedb_records(lua_State *l)
 {
-	whitedb_instance* instance = lua_touserdata(l, 1);
-	assert(instance);
+	assert(lua_gettop(l) > 0);
+	whitedb_instance* pInstance = lua_touserdata(l, 1);
+	assert(pInstance);
 
-	whitedb_record_iterator* rec_iterator = (whitedb_record_iterator*)lua_newuserdata(l, sizeof(whitedb_record_iterator));
-	rec_iterator->mode = 1;
-	rec_iterator->parent = NULL;
-	rec_iterator->record = NULL;
-	rec_iterator->whitedb = instance->whitedb;
-
-	lua_rawgeti(l, LUA_REGISTRYINDEX, whitedb_record_iterator_ref);
-	lua_setmetatable(l, -2);
+	whitedb_record_iterator* pRecIterator = (whitedb_record_iterator*)lua_newuserdata(l, sizeof(whitedb_record_iterator));
+	pRecIterator->iMode = 1;
+	pRecIterator->pParent = NULL;
+	pRecIterator->pRecord = NULL;
+	pRecIterator->pWhiteDb = pInstance->pWhiteDb;
 	lua_pushcclosure(l, whitedb_records_iterator, 1);
 	return 1;
 }
@@ -275,30 +326,29 @@ static int whitedb_records(lua_State *l)
 //---------------------------------------------------------
 static int whitedb_record_field_size(lua_State *l)
 {
-	whitedb_record* record = lua_touserdata(l, 1);
-	assert(record);
-	wg_int size = wg_get_record_len(record->whitedb, record->record);
-	if (size < 0)
+	assert(lua_gettop(l) > 0);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	assert(pRecord);
+	wg_int iSize = wg_get_record_len(pRecord->pWhiteDb, pRecord->pRecord);
+	if (iSize < 0)
 		lua_pushnil(l);
 	else
-		lua_pushinteger(l, size);
+		lua_pushinteger(l, iSize);
 	return 1;
 }
 
 //---------------------------------------------------------
 static int whitedb_record_parents(lua_State *l)
 {
-	whitedb_record* record = lua_touserdata(l, 1);
-	assert(record);
+	assert(lua_gettop(l) > 0);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	assert(pRecord);
 
-	whitedb_record_iterator* rec_iterator = (whitedb_record_iterator*)lua_newuserdata(l, sizeof(whitedb_record_iterator));
-	rec_iterator->mode = 2;
-	rec_iterator->parent = NULL;
-	rec_iterator->record = record->record;
-	rec_iterator->whitedb = record->whitedb;
-
-	lua_rawgeti(l, LUA_REGISTRYINDEX, whitedb_record_iterator_ref);
-	lua_setmetatable(l, -2);
+	whitedb_record_iterator* pRecordIterator = (whitedb_record_iterator*)lua_newuserdata(l, sizeof(whitedb_record_iterator));
+	pRecordIterator->iMode = 2;
+	pRecordIterator->pParent = NULL;
+	pRecordIterator->pRecord = pRecord->pRecord;
+	pRecordIterator->pWhiteDb = pRecord->pWhiteDb;
 	lua_pushcclosure(l, whitedb_records_iterator, 1);
 	return 1;
 }
@@ -307,12 +357,12 @@ static int whitedb_record_parents(lua_State *l)
 static int whitedb_record_delete2(lua_State *l)
 {
 	assert(lua_gettop(l) > 1);
-	whitedb_instance* instance = lua_touserdata(l, 1);
-	assert(instance);
-	whitedb_record* record = lua_touserdata(l, 2);
-	assert(record);
+	whitedb_instance* pInstance = lua_touserdata(l, 1);
+	assert(pInstance);
+	whitedb_record* pRecord = lua_touserdata(l, 2);
+	assert(pRecord);
 
-	wg_int iSuccess = wg_delete_record(record->whitedb, record->record);
+	wg_int iSuccess = wg_delete_record(pRecord->pWhiteDb, pRecord->pRecord);
 	lua_pushboolean(l, iSuccess == 0);
 	lua_pushinteger(l, iSuccess);
 	return 2;
@@ -321,9 +371,11 @@ static int whitedb_record_delete2(lua_State *l)
 //---------------------------------------------------------
 static int whitedb_read_start(lua_State *l)
 {
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-	lua_pushboolean( l, wg_start_read( instance->whitedb) );
+	assert(lua_gettop(l) > 0);
+
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	lua_pushboolean( l, wg_start_read(pInstance->pWhiteDb) );
 	return 1;
 }
 
@@ -331,18 +383,20 @@ static int whitedb_read_start(lua_State *l)
 static int whitedb_read_end(lua_State *l)
 {
 	assert(lua_gettop(l) > 1);
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-	lua_pushinteger(l, wg_end_read(instance->whitedb, lua_tointeger(l,2) ));
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	lua_pushinteger(l, wg_end_read(pInstance->pWhiteDb, lua_tointeger(l,2) ));
 	return 1;
 }
 
 //---------------------------------------------------------
 static int whitedb_write_start(lua_State *l)
 {
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-		lua_pushinteger(l, wg_start_write(instance->whitedb));
+	assert(lua_gettop(l) > 0);
+
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+		lua_pushinteger(l, wg_start_write(pInstance->pWhiteDb));
 	return 1;
 }
 
@@ -350,95 +404,413 @@ static int whitedb_write_start(lua_State *l)
 static int whitedb_write_end(lua_State *l)
 {
 	assert(lua_gettop(l) > 1);
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-		lua_pushinteger(l, wg_end_write(instance->whitedb, lua_tointeger(l, 2)));
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+		lua_pushinteger(l, wg_end_write(pInstance->pWhiteDb, lua_tointeger(l, 2)));
 	return 1;
 }
 //---------------------------------------------------------
-static int whitedb_log_start(lua_State *l) {
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-		lua_pushinteger(l, wg_start_logging(instance->whitedb));
+static int whitedb_log_start(lua_State *l)
+{
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+		lua_pushinteger(l, wg_start_logging(pInstance->pWhiteDb));
 	return 1;
 }
 
 //---------------------------------------------------------
-static int whitedb_log_stop(lua_State *l) {
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-		lua_pushinteger(l, wg_stop_logging( instance->whitedb ));
+static int whitedb_log_stop(lua_State *l)
+{
+	assert(lua_gettop(l) > 0);
+
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+		lua_pushinteger(l, wg_stop_logging(pInstance->pWhiteDb ));
 	return 1;
 }
 
 
 //---------------------------------------------------------
-static int whitedb_dump(lua_State *l) {
+static int whitedb_dump_export(lua_State *l) {
 	assert(lua_gettop(l) > 1);
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-		lua_pushinteger(l, wg_dump( instance->whitedb, lua_tostring(l,2) ));
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	int iResult = wg_dump(pInstance->pWhiteDb, (char*)lua_tostring(l, 2));
+	lua_pushinteger(l, iResult == 0 ? 1 : 0 );
 	return 1;
 }
 
 //---------------------------------------------------------
 static int whitedb_dump_import(lua_State *l) {
-	assert(lua_gettop(l) > 1);
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-	if (lua_toboolean(l, -1)) {
-		lua_pushinteger(l, wg_import_dump(instance->whitedb, lua_tostring(l, 1)) );
-	}
-	else
+	assert(lua_gettop(l) > 0);
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance);
+	int iResult = wg_import_dump(pInstance->pWhiteDb, (char*)lua_tostring(l, 1));
+	lua_pushboolean(l, iResult == 0 ? 1 : 0 );
+	return 1;
+}
+
+//---------------------------------------------------------
+static int whitedb_find_record(lua_State *l)
+{
+	whitedb_find_iterator* pIterator = (whitedb_find_iterator*)lua_touserdata(l, lua_upvalueindex(1));
+	
+	if (pIterator->iFieldType == LUA_TNONE)
+		return 0;
+	
+	void* pRec = NULL;
+
+	switch (pIterator->iFieldType )
 	{
-		lua_pushinteger(l, wg_import_db_csv(instance->whitedb, lua_tostring(l, 1) ));
+		case LUA_TNUMBER:
+		{
+			pRec = wg_find_record_double(pIterator->pWhiteDb, pIterator->iFieldIndex, pIterator->iFiendCond, pIterator->dValue, pIterator->pRecord);
+			break;
+		}
+		case LUA_TSTRING:
+		{
+			pRec = wg_find_record_str(pIterator->pWhiteDb, pIterator->iFieldIndex, pIterator->iFiendCond, pIterator->sValue, pIterator->pRecord);
+			break;
+		}
+		case LUA_TBOOLEAN:
+		{
+			pRec = wg_find_record_int(pIterator->pWhiteDb, pIterator->iFieldIndex, pIterator->iFiendCond, pIterator->bValue, pIterator->pRecord);
+			break;
+		}
+		case LUA_TNIL:
+		{
+			pRec = wg_find_record_null(pIterator->pWhiteDb, pIterator->iFieldIndex, pIterator->iFiendCond, 0, pIterator->pRecord);
+			break;
+		}
+		default:
+			break;
 	}
+
+	if (pRec)
+	{
+		pIterator->pRecord = pRec;
+		return whitedb_record_to_userdata(pIterator->pWhiteDb, pRec, 0, l);
+	}
+
+	return 0;
+}
+
+//---------------------------------------------------------
+static int whitedb_find(lua_State *l)
+{
+	assert(lua_gettop(l) > 3);
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+
+	int iColumn             = lua_tointeger(l, 2);
+	const char* sCondition  = lua_tostring(l, 3);
+	int iType               = lua_type(l, 4);
+	int iCondition          = str_to_cond(sCondition);
+	void* pRec              = NULL;
+
+	whitedb_find_iterator* pFindIterator = (whitedb_find_iterator*)lua_newuserdata(l, sizeof(whitedb_find_iterator));
+	
+	pFindIterator->pWhiteDb = pInstance->pWhiteDb;
+	pFindIterator->iFieldIndex = iColumn;
+	pFindIterator->iFieldType = iType;
+	pFindIterator->iFiendCond = iCondition;
+	pFindIterator->pRecord = NULL;
+
+	switch (iType)
+	{
+		case LUA_TNUMBER:
+		{
+			pFindIterator->dValue = lua_tonumber(l, 4);
+			break;
+		}
+		case LUA_TSTRING:
+		{
+			strcpy_s( pFindIterator->sValue, WHITEDB_MAX_FIND_STR_SIZE, lua_tostring(l, 4) );
+			break;
+		}
+		case LUA_TBOOLEAN:
+		{
+			pFindIterator->bValue = lua_toboolean(l, 4) ? 1 : 0;
+			break;
+		}
+		case LUA_TNIL:
+		{
+			break;
+		}
+		default:
+			pFindIterator->iFieldType = LUA_TNONE;
+			break;
+	}
+
+	lua_pushcclosure(l, whitedb_find_record, 1);
+	return 1;
+}
+
+//---------------------------------------------------------
+wg_int lua_value_to_wg(void* db, lua_State *l, int index)
+{
+	wg_int iResult = 0;
+	int iType = lua_type(l, index);
+	switch (iType)
+	{
+		case LUA_TNUMBER:
+		{
+			double dValue = lua_tonumber(l, index);
+			iResult = wg_encode_double(db, dValue);
+			break;
+		}
+		case LUA_TSTRING:
+		{
+			const char* sValue = lua_tostring(l, index);
+			iResult = wg_encode_str(db, (char*)sValue, NULL);
+			break;
+		}
+		case LUA_TBOOLEAN:
+		{
+			int iValue = lua_tointeger(l, index);
+			iResult = wg_encode_int(db, iValue );
+			break;
+		}
+		case LUA_TLIGHTUSERDATA:
+		{
+			void* pUserData = lua_touserdata(l, index);
+			int iSize = lua_objlen(l, index);
+			assert(iSize == sizeof(void*));
+			iResult = wg_encode_blob(db,(char*) &pUserData, NULL, sizeof(void*)  );
+		}
+		case LUA_TNIL:
+		default:
+			iResult = wg_encode_null(db, 0);
+			break;
+	}
+	return iResult;
+}
+
+//---------------------------------------------------------
+// find db, index, cond, value
+static int whitedb_find_one(lua_State *l) {
+	assert(lua_gettop(l) > 3);
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+
+	int               iFieldIndex = lua_tointeger(l, 2);
+	const char*       sCondition  = lua_tostring(l, 3);
+	int               iType       = lua_type(l, 4);
+	int               iCondition  = str_to_cond(sCondition);
+	void*             pRec        = NULL;
+	switch (iType)
+	{
+		case LUA_TNUMBER:
+		{
+			pRec = wg_find_record_double(pInstance->pWhiteDb, iFieldIndex, iCondition, lua_tonumber(l, 4), NULL);
+			break;
+		}
+		case LUA_TSTRING:
+		{
+			pRec = wg_find_record_str(pInstance->pWhiteDb, iFieldIndex, iCondition, (char*)lua_tostring(l, 4), NULL);
+			break;
+		}
+		case LUA_TBOOLEAN:
+		{
+			pRec = wg_find_record_int(pInstance->pWhiteDb, iFieldIndex, iCondition, lua_toboolean(l, 4) ? 1 : 0 , NULL);
+			break;
+		}
+		case LUA_TNIL:
+		{
+			pRec = wg_find_record_null(pInstance->pWhiteDb, iFieldIndex, iCondition, 0, NULL);
+			break;
+		}
+		default:
+			break;
+	}
+	
+	if (pRec)
+		whitedb_record_to_userdata( pInstance->pWhiteDb, pRec, 0, l);
+	else
+		lua_pushnil(l);
+
 	return 1;
 }
 
 //---------------------------------------------------------
 static int whitedb_size(lua_State *l) {
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-	lua_pushnumber(l, wg_database_size(instance->whitedb));
+	assert(lua_gettop(l) > 0);
+
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	lua_pushnumber(l, wg_database_size(pInstance->pWhiteDb));
 	return 1;
 }
 
 //---------------------------------------------------------
 static int whitedb_free_size(lua_State *l) {
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-	lua_pushnumber(l, wg_database_freesize(instance->whitedb));
+	assert(lua_gettop(l) > 0);
+
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	lua_pushnumber(l, wg_database_freesize(pInstance->pWhiteDb));
 	return 1;
 }
 
 //---------------------------------------------------------
 static int whitedb_log_replay(lua_State *l) {
 	assert(lua_gettop(l) > 1);
-	whitedb_instance* instance = check_instance(l, 1);
-	INSTANCE_EXIT_NIL(instance)
-	lua_pushinteger(l, wg_replay_log(instance->whitedb, lua_tostring(l,2) ));
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	lua_pushinteger(l, wg_replay_log(pInstance->pWhiteDb, (char*)lua_tostring(l,2) ));
 	return 1;
 }
 
+//---------------------------------------------------------
+// 
+static int whitedb_index_create(lua_State *l) {
+	assert(lua_gettop(l) > 1);
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	int iFieldIndex = lua_tointeger(l, 2);
+
+	if (wg_column_to_index_id(pInstance->pWhiteDb, iFieldIndex, WG_INDEX_TYPE_TTREE, NULL, 0) == -1)
+		lua_pushboolean(l, wg_create_index(pInstance->pWhiteDb, iFieldIndex, WG_INDEX_TYPE_TTREE, NULL, 0) == 0 ? 1 : 0 );
+	else
+		lua_pushboolean(l, 0 );
+
+	return 1;
+}
+
+//---------------------------------------------------------
+// db, index, table
+static int whitedb_index_multi(lua_State *l) {
+	assert(lua_gettop(l) > 2);
+	if (lua_type(l, 3) != LUA_TTABLE || lua_objlen(l , 3) == 0 )
+	{
+		lua_pushboolean(l, 0);
+		return 1;
+	}
+	
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	wg_int iFieldIndex = lua_tointeger(l, 2);
+	wg_int record_index = 0;
+	wg_int Match_rec[DWhiteDbMaxMultiIndexSize];
+
+	lua_pushnil(l);
+	while ( lua_next(l, 3) != 0 )
+	{
+		Match_rec[record_index] = lua_value_to_wg(pInstance->pWhiteDb, l, -1);
+		record_index++;
+		lua_pop(l, 1);
+	}
+		
+	wg_int result = wg_create_index(pInstance->pWhiteDb, iFieldIndex, WG_INDEX_TYPE_TTREE, Match_rec, record_index);
+	lua_pushboolean(l, result == 0 ? 0 : 1);
+	return 1;
+}
+
+//---------------------------------------------------------
+static int whitedb_query_record(lua_State *l)
+{
+	assert(lua_gettop(l) > 0);
+
+	whitedb_query_iterator* pIterator = (whitedb_query_iterator*)lua_touserdata(l, lua_upvalueindex(1));
+	void* pRecord = wg_fetch(pIterator->pWhiteDb, pIterator->pQuery);
+	if (pRecord)
+		return whitedb_record_to_userdata(pIterator->pWhiteDb, pRecord, 0, l);
+
+	wg_free_query(pIterator->pWhiteDb, pIterator->pQuery);
+	return 0;
+}
+
+//---------------------------------------------------------
+static void calc_query_param(void* db, wg_query_arg* arg, lua_State* l, int iIndex )
+{
+	lua_pushnil(l);
+	while (lua_next(l, iIndex))
+	{
+		if (lua_type(l, -2) == LUA_TSTRING)
+		{
+			const char *key = lua_tostring(l, -2);
+			
+			if (strcmp(key, "cond") == 0)
+				arg->cond =  str_to_cond( lua_tostring( l, -1) );
+
+			if (strcmp(key, "value") == 0)
+				arg->value = lua_value_to_wg(db, l, -1);
+
+			if (strcmp(key, "column") == 0)
+				arg->column = lua_tointeger(l, -1);
+
+		}
+		lua_pop(l, 1);
+	}
+}
+
+//---------------------------------------------------------
+// db, table
+static int whitedb_query(lua_State *l) {
+
+	assert(lua_gettop(l) > 1 );
+	if (lua_type(l, 2) != LUA_TTABLE || lua_objlen(l, 2) == 0)
+		return 0;
+
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+
+	wg_int iQuery_size = 0;
+
+	wg_query_arg Query_arg_list[DWhiteDbMaxQuerySize];
+	wg_query* Query = NULL;
+
+	lua_pushnil(l);
+	while (lua_next(l, 2) != 0)
+	{
+		if ( lua_type(l, -1) == LUA_TTABLE )
+		{
+			calc_query_param(pInstance->pWhiteDb, &Query_arg_list[iQuery_size], l, lua_gettop(l));
+			iQuery_size++;
+		}
+		lua_pop(l, 1);
+	}
+
+	Query = wg_make_query( pInstance->pWhiteDb, NULL, 0, Query_arg_list, iQuery_size);
+	if (Query)
+	{
+		whitedb_query_iterator* pQuery_iterator = (whitedb_query_iterator*)lua_newuserdata(l, sizeof(whitedb_query_iterator));
+		pQuery_iterator->pQuery = Query;
+		pQuery_iterator->pWhiteDb = pInstance->pWhiteDb;
+		lua_pushcclosure(l, whitedb_query_record, 1);
+		return 1;
+	}
+
+	return 0;
+}
+
+//---------------------------------------------------------
+// 
+static int whitedb_index_drop(lua_State *l) {
+	assert(lua_gettop(l) > 1);
+	whitedb_instance* pInstance = check_instance(l, 1);
+	INSTANCE_EXIT_NIL(pInstance)
+	lua_pushboolean( l, wg_drop_index(pInstance->pWhiteDb, lua_tointeger(l, 2) ) == 0 ? 1 : 0 );
+	return 1;
+}
 
 //---------------------------------------------------------
 static int whitedb_gc(lua_State *l)
 {
-	whitedb_instance* instance = lua_touserdata(l, 1);
-	assert(instance);
-	assert(instance->whitedb);
+	whitedb_instance* pInstance = lua_touserdata(l, 1);
+	assert(pInstance);
+	assert(pInstance->pWhiteDb);
 
-	if (instance)
+	if (pInstance)
 	{
-		if ( instance->mode == 3 ) // existing
-			wg_detach_database(instance->whitedb);
-		if (instance->mode == 2) // local db
-			wg_delete_local_database(instance->whitedb);
+		if ( pInstance->iMode == 3 ) // existing
+			wg_detach_database(pInstance->pWhiteDb);
+		if (pInstance->iMode == 2) // local db
+			wg_delete_local_database(pInstance->pWhiteDb);
 		else 
-			wg_delete_database(instance->whitedb);
+			wg_delete_database(pInstance->sName);
 	}
-	free( instance );
+	return 0;
 }
 
 
@@ -454,47 +826,50 @@ static int whitedb_gc(lua_State *l)
 
 static int whitedb_attach(lua_State *l) {
 
-	int param_size = lua_gettop(l);
+	assert(lua_gettop(l) > 0);
 
-	const char* name = param_size > 0 ? lua_tostring (l, 1) : NULL;
-	int   size       = param_size > 1 ? lua_tointeger(l, 2) : 0;
-	int   mode       = param_size > 2 ? lua_tointeger(l, 3) : 0;
-	int	  permission = param_size > 3 ? lua_tointeger(l, 4) : 0;
-	void* db = NULL;
-	if (strlen(name) == 0)
+	int iParamCount = lua_gettop(l);
+
+	const char* sName = iParamCount > 0 ? lua_tostring (l, 1) : NULL;
+	wg_int iSize      = iParamCount > 1 ? lua_tointeger(l, 2) : 0;
+	int   iMode       = iParamCount > 2 ? lua_tointeger(l, 3) : 0;
+	int	  iPermission = iParamCount > 3 ? lua_tointeger(l, 4) : 0;
+	void* pDb          = NULL;
+
+	if (strlen(sName) == 0)
 	{
 		luaL_error(l, "Invalid database name");
 		return 0;
 	}
 
-	if (mode == 2)
+	if (iMode == 2)
 	{
-		db = wg_attach_local_database(size);
+		pDb = wg_attach_local_database(iSize);
 	}
-	else if (mode == 1)
+	else if (iMode == 1)
 	{
-		if (permission != 0)
-			db = wg_attach_logged_database_mode(name, size, mode);
+		if (iPermission != 0)
+			pDb = wg_attach_logged_database_mode((char*)sName, iSize, iMode);
 		else
-			db = wg_attach_logged_database(name, size);
+			pDb = wg_attach_logged_database((char*)sName, iSize);
 	}
-	else if (mode == 3)
-		db = wg_attach_existing_database(name);
+	else if (iMode == 3)
+		pDb = wg_attach_existing_database((char*)sName);
 	else
 	{
-		if (mode != 0)
-			db = wg_attach_database_mode(name, size, mode);
+		if (iMode != 0)
+			pDb = wg_attach_database_mode((char*)sName, iSize, iMode);
 		else
-			db = wg_attach_database(name, size);
+			pDb = wg_attach_database((char*)sName, iSize);
 	}
 
-	if (db)
+	if (pDb)
 	{
-		whitedb_instance* instance = (whitedb_instance*)lua_newuserdata(l, sizeof(whitedb_instance));
-		instance->mode = mode;
-		instance->permissions = permission;
-		instance->whitedb = db;
-		strcpy_s(instance->name, DWhiteDbNameSize, name);
+		whitedb_instance* pInstance = (whitedb_instance*)lua_newuserdata(l, sizeof(whitedb_instance));
+		pInstance->iMode = iMode;
+		pInstance->iPermissions = iPermission;
+		pInstance->pWhiteDb = pDb;
+		strcpy_s(pInstance->sName, DWhiteDbNameSize, sName);
 		lua_rawgeti(l, LUA_REGISTRYINDEX, whitedb_metatable_ref);
 		lua_setmetatable(l, -2);
 	}
@@ -504,19 +879,54 @@ static int whitedb_attach(lua_State *l) {
 	return 1;
 }
 
+
+
+//-------------------------------------------------------------------------
+
+static int whitedb_record_field_set_t(lua_State *l)
+{
+	assert(lua_gettop(l) > 1);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	assert(pRecord);
+
+	if (lua_type(l, 2) != LUA_TTABLE)
+	{
+		lua_pushinteger(l,0);
+		return 1;
+	}
+
+	wg_int iLen = wg_get_record_len(pRecord->pWhiteDb, pRecord->pRecord);
+	int    iRec = 0;
+	for (int iIndex = 1; iIndex <= iLen; iIndex++ )
+	{		
+		lua_rawgeti(l, 2, iIndex );
+		if (!lua_isnil(l, -1))
+		{
+
+			wg_int wg_data = lua_value_to_wg(pRecord->pWhiteDb, l, -1);
+			if ( wg_set_field(pRecord->pWhiteDb, pRecord->pRecord, iIndex - 1, wg_data) == 0 )
+				iRec++;
+		}
+		lua_pop(l, 1);
+	}
+
+	lua_pushinteger(l, iRec);
+	return 1;
+}
+
 //-------------------------------------------------------------------------
 static int whitedb_record_field_set(lua_State *l)
 {
 	assert(lua_gettop(l) > 2);
-	whitedb_record* record = lua_touserdata(l, 1);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
 	int             iIndex = lua_tointeger(l, 2);
 	int             iType = lua_type(l, 3);
-	assert(record);
+	assert(pRecord);
 	wg_int          iData = 0;
-	wg_int          iLen = wg_get_record_len(record->whitedb, record->record);
+	wg_int          iLen = wg_get_record_len(pRecord->pWhiteDb, pRecord->pRecord);
 	wg_int          iResult = 0;
-
-	if (iIndex >= iLen)
+	iIndex--;
+	if (iIndex > iLen)
 	{
 #ifdef _DEBUG
 		luaL_error(l, "Invalid field index %d", iIndex);
@@ -525,104 +935,158 @@ static int whitedb_record_field_set(lua_State *l)
 		return 1;
 #endif
 	}
-
-		switch (iType)
-		{
-			case LUA_TBOOLEAN: 
-			{
-				iData = wg_encode_int(record->whitedb, lua_toboolean(l, iIndex));
-				break;
-			}
-
-			case LUA_TSTRING:
-			{
-				const char* pStr = lua_tostring(l, iIndex);
-				iData = wg_encode_str(record->whitedb,  pStr , NULL);
-				break;
-			}
-
-			case LUA_TNUMBER:
-			{
-				double dValue = lua_tonumber(l, iIndex);
-				iData = wg_encode_double(record->whitedb, dValue);
-				break;
-			}
-
-			case LUA_TNIL:
-			default:
-			{
-				iData = wg_encode_null(record->whitedb, 0);
-				break;
-			}
-		}
-	iResult = wg_set_field(record->whitedb, record->record, iIndex, iData);
+	iData = lua_value_to_wg(pRecord->pWhiteDb, l, 3);
+	iResult = wg_set_field(pRecord->pWhiteDb, pRecord->pRecord, iIndex, iData);
 	lua_pushboolean(l, iResult == 0);
-	lua_pushinteger(l, iResult);
-	return 2;
+	return 1;
 }
 
 //-------------------------------------------------------------------------
 static int whitedb_record_new(lua_State *l)
 {
-	assert( lua_gettop(l) > 2 );
-	whitedb_record* record = lua_touserdata(l, 1);
-	wg_int          index  = lua_tointeger(l, 2);
-	int             size   = lua_tointeger(l, 3);
+	assert( lua_gettop(l) > 1 );
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	wg_int          iIndex  = lua_tointeger(l, 2);
+	int             iSize   = lua_tointeger(l, 3);
 
-	assert(record);
-	assert(record->whitedb);
-	
-	void* pRecord = wg_create_record( record->whitedb, size);
-	wg_int newrec = wg_encode_record( record->whitedb, pRecord);
-	wg_int field  = wg_set_field(record->whitedb, record->record, index, newrec );
+	assert(pRecord);
+	assert(pRecord->pWhiteDb);
 
-	lua_pushboolean(l, field == 0 ? 1 : 0);
-	return whitedb_record_to_state(record->whitedb, pRecord, size, l );
+	void* pNewRecord = wg_create_record( pRecord->pWhiteDb, iSize);
+	wg_int newrec = wg_encode_record( pRecord->pWhiteDb, pNewRecord);
+	wg_int field  = wg_set_field(pRecord->pWhiteDb, pRecord->pRecord, iIndex, newrec );
+
+	return whitedb_record_to_userdata(pRecord->pWhiteDb, pRecord, iSize, l );
 }
-
-//-------------------------------------------------------------------------
-static int whitedb_record_field_new(lua_State *l)
-{
-	assert(lua_gettop(l) > 1);
-	whitedb_record* record = lua_touserdata(l, 1);
-	int             index  = lua_tointeger(l, 2);	
-	wg_int iResult = wg_set_new_field(record->whitedb, record->record, index, 0);
-	lua_pushboolean(l, iResult > 0);
-	return 1;
-}
-
 
 //-------------------------------------------------------------------------
 static int whitedb_record_print(lua_State *l)
 {
-	assert(lua_gettop(l) > 1);
-	whitedb_record* record = lua_touserdata(l, 1);
-	wg_print_record(record->whitedb, record->record);
+	assert(lua_gettop(l) > 0);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	wg_print_record(pRecord->pWhiteDb, pRecord->pRecord);
 	return 0;
+}
+
+//-------------------------------------------------------------------------
+static int whitedb_record_field_type(lua_State *l)
+{
+	assert(lua_gettop(l) > 1);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	wg_int          iRecord = lua_tointeger(l, 2);
+	iRecord--;
+	lua_pushinteger( l,  wg_get_field_type (pRecord->pWhiteDb, pRecord->pRecord, iRecord) );
+	return 1;
+}
+
+//-------------------------------------------------------------------------
+static int wg_value_to_lua( lua_State *l, int iFieldType, void* pWhiteDb, wg_int pField )
+ {
+	int iResult = 0;
+
+	switch (iFieldType)
+	{
+	case WG_INTTYPE:
+	{
+		int bValue = wg_decode_int(pWhiteDb, pField);
+		lua_pushboolean(l, bValue);
+		iResult = 1;
+		break;
+	}
+	case WG_DOUBLETYPE:
+	{
+		double dValue = wg_decode_double(pWhiteDb, pField);
+		lua_pushnumber(l, dValue);
+		iResult = 1;
+		break;
+	}
+
+	case WG_STRTYPE:
+	{
+		char* sValue = wg_decode_str(pWhiteDb, pField);
+		lua_pushstring(l, sValue);
+		iResult = 1;
+		break;
+	}
+	case WG_BLOBTYPE:
+	{
+		int    iSize = wg_decode_blob_len(pWhiteDb, pField);
+		assert(iSize == sizeof(void*));
+		void** pData = (void**) wg_decode_blob(pWhiteDb, pField);
+		lua_pushlightuserdata(l, *pData);
+		iResult = 1;
+		break;
+	}
+	case WG_RECORDTYPE:
+	{
+		void* pData = wg_decode_record(pWhiteDb, pField);
+		whitedb_record_to_userdata(pWhiteDb, pData,0,l);
+		iResult = 1;
+		break;
+	}
+	case WG_NULLTYPE:
+	default:
+		iResult = 1;
+		lua_pushnil(l);
+		break;
+	}
+	return iResult;
+}
+
+//-------------------------------------------------------------------------
+static int whitedb_record_field_get_t(lua_State *l)
+{
+	int iTop = lua_gettop(l);
+	assert(iTop > 0);
+
+	whitedb_record* pRecord = lua_touserdata(l, 1);
+	assert(pRecord);
+	wg_int iSize = 0;
+	wg_int iFieldType = 0;
+	wg_int pField = 0;
+	int    iResult = 0;
+
+	if (iTop < 2)
+	{
+		lua_newtable(l);
+		iResult = 1;
+	}
+
+	wg_int iLen = wg_get_record_len(pRecord->pWhiteDb, pRecord->pRecord);
+
+	for (int iIndex = 1; iIndex <= iLen; iIndex++)
+	{
+		iFieldType = wg_get_field_type(pRecord->pWhiteDb, pRecord->pRecord, iIndex - 1);
+		pField = wg_get_field(pRecord->pWhiteDb, pRecord->pRecord, iIndex - 1);
+		iSize = wg_value_to_lua(l, iFieldType, pRecord->pWhiteDb, pField);
+		if (iSize)
+			lua_rawseti(l, -2, iIndex);
+	}
+	return iResult;
 }
 
 //-------------------------------------------------------------------------
 static int whitedb_record_field_get(lua_State *l)
 {
 	assert(lua_gettop(l) > 1);
-	whitedb_record* record = lua_touserdata(l, 1);
+	whitedb_record* pRecord = lua_touserdata(l, 1);
 	int             iIndex = lua_tointeger(l, 2);
 
-	assert(record);
+	assert(pRecord);
 	wg_int          iData = 0;
-	wg_int          iLen = wg_get_record_len(record->whitedb, record->record);
+	wg_int          iLen = wg_get_record_len(pRecord->pWhiteDb, pRecord->pRecord);
 	wg_int          iResult = 0;
-
-	if (iIndex >= iLen)
+	iIndex--;
+	if (iIndex > iLen)
 	{
-		lua_pushboolean(l, 0);
+		lua_pushnil(l);
 		return 1;
 	}
 	
-	wg_int iFieldType = wg_get_field_type(record->whitedb, record->record, iIndex);
-	wg_int pField = wg_get_field(record->whitedb, record->record, iIndex);
+	wg_int iFieldType = wg_get_field_type(pRecord->pWhiteDb, pRecord->pRecord, iIndex);
+	wg_int pField = wg_get_field(pRecord->pWhiteDb, pRecord->pRecord, iIndex);
 
-	if (!pField)
+	if ( pField == 0 || pField == WG_ILLEGAL)
 	{
 #ifdef _DEBUG
 		luaL_error(l, "Invalid field value!");
@@ -631,58 +1095,22 @@ static int whitedb_record_field_get(lua_State *l)
 		return 1;
 #endif
 	}
-
-	switch (iFieldType)
-	{
-		case WG_INTTYPE:
-		{
-			int bValue = wg_decode_int(record->whitedb, pField);
-			lua_pushboolean(l, bValue);
-			break;
-		}
-		case WG_DOUBLETYPE:
-		{
-			double dValue = wg_decode_double(record->whitedb, pField);
-			lua_pushnumber(l, dValue );
-			break;
-		}
-
-		case WG_STRTYPE:
-		{
-			char* sValue = wg_decode_str(record->whitedb, pField);
-			lua_pushstring(l, sValue);
-			break;
-		}
-		case WG_NULLTYPE:
-		case WG_RECORDTYPE:
-		default:
-			lua_pushnil(l);
-		break;
-	}
-
-	return 1;
+	return wg_value_to_lua(l, iFieldType, pRecord->pWhiteDb, pField);
 }
-
-//---------------------------------------------------------
-static const struct luaL_Reg lib_whitedb_record_iterator_meta[] =
-{
-	{ "__gc",		whitedb_record_iterator_gc },
-	{ NULL, NULL }
-};
 
 //---------------------------------------------------------
 static const struct luaL_Reg lib_whitedb_record_meta[] =
 {
-	{ "create",		whitedb_record_create },
 	{ "delete",		whitedb_record_delete },
 	{ "parents",	whitedb_record_parents },
 	{ "size",    	whitedb_record_field_size },
 	{ "set",        whitedb_record_field_set },
 	{ "get",        whitedb_record_field_get },
-	{ "add_field",  whitedb_record_field_new },
-	{ "add_rec",    whitedb_record_new },
+	{ "set_t",      whitedb_record_field_set_t },
+	{ "get_t",      whitedb_record_field_get_t },
+	{ "type",       whitedb_record_field_type },
+	{ "record",     whitedb_record_new },
 	{ "print",      whitedb_record_print },
-	{ "__gc",		whitedb_record_gc },
 	{ NULL, NULL }
 };
 
@@ -696,7 +1124,7 @@ static const struct luaL_Reg lib_whitedb[] =
 //---------------------------------------------------------
 static const struct luaL_Reg lib_whitedb_meta[] =
 {
-	{ "create",			whitedb_record_create2 },
+	{ "create",			whitedb_record_create },
 	{ "delete",			whitedb_record_delete2 },
 	{ "records",		whitedb_records },
 	{ "read_start",     whitedb_read_start },
@@ -707,7 +1135,20 @@ static const struct luaL_Reg lib_whitedb_meta[] =
 	{ "log_stop",       whitedb_log_stop},
 	{ "log_replay",     whitedb_log_replay },
 	{ "size",           whitedb_size },
+	{ "find_one",       whitedb_find_one },
+	{ "find",           whitedb_find },
 	{ "free_size",      whitedb_free_size },
+	{ "index_s",        whitedb_index_create },
+	{ "index_m",        whitedb_index_multi },
+	{ "index_drop",     whitedb_index_drop },
+	{ "query",          whitedb_query },
+	{ "clear",          whitedb_clear },
+	{ "print",          whitedb_print },
+	{ "import_csv",     whitedb_import_csv },
+	{ "export_csv",     whitedb_export_csv },
+	{ "import_dump",    whitedb_dump_import },
+	{ "export_dump",    whitedb_dump_export },
+	
 	{ "__gc",		    whitedb_gc },
 	{ NULL, NULL }
 };
@@ -723,6 +1164,7 @@ static int register_whitedb_meta(lua_State *l)
 
 	luaL_getmetatable(l, WHITEDB_METATABLE);
 	whitedb_metatable_ref = luaL_ref(l, LUA_REGISTRYINDEX);
+	return 0;
 }
 
 //---------------------------------------------------------
@@ -736,23 +1178,13 @@ static int register_whitedb_record_meta(lua_State *l)
 
 	luaL_getmetatable(l, WHITEDB_RECORD_METATABLE);
 	whitedb_record_metatable_ref = luaL_ref(l, LUA_REGISTRYINDEX);
-}
-
-//---------------------------------------------------------
-static int register_whitedb_record_iterator_meta(lua_State *l)
-{
-	luaL_newmetatable(l, WHITEDB_ITARATOR_METATABLE);
-	luaL_register(l, NULL, lib_whitedb_record_iterator_meta);
-
-	luaL_getmetatable(l, WHITEDB_ITARATOR_METATABLE);
-	whitedb_record_iterator_ref = luaL_ref(l, LUA_REGISTRYINDEX);
+	return 0;
 }
 
 //---------------------------------------------------------
 WHITE_DB_EXPORT int luaopen_whitedb(lua_State *l)
 {
-	register_whitedb_record_iterator_meta(l);
 	register_whitedb_record_meta(l);
 	register_whitedb_meta(l);
-	return 1;
+	return 0;
 }
