@@ -5,16 +5,12 @@
 **
 **/
 
-extern "C"
-{
 
 #include <lua.h>
 #include <lauxlib.h>
 
 #include "dbapi.h"
 #include "indexapi.h" 
-
-};
 
 #include "lwhitedb.h"
 #include <string.h>
@@ -194,7 +190,9 @@ static int whitedb_record_create(lua_State *l)
 
 	assert(pInstance);
 	assert(pInstance->pWhiteDb);
+
 	return whitedb_record_to_userdata(pInstance->pWhiteDb, NULL, iSize, l);
+
 }
 
 //---------------------------------------------------------
@@ -913,7 +911,7 @@ static int whitedb_gc(lua_State *l)
 	{
 		if ( pInstance->iMode == 3 ) // existing
 			wg_detach_database(pInstance->pWhiteDb);
-		if (pInstance->iMode == 2) // local db
+		else if (pInstance->iMode == 2) // local db
 		{
 			wg_detach_database( pInstance->pWhiteDb);
 			wg_delete_local_database(pInstance->pWhiteDb);
@@ -1118,6 +1116,7 @@ static int whitedb_record_new(lua_State *l)
 	return whitedb_record_to_userdata(pRecord->pWhiteDb, pRecord, iSize, l );
 }
 
+
 //-------------------------------------------------------------------------
 static int whitedb_record_print(lua_State *l)
 {
@@ -1272,6 +1271,7 @@ static const struct luaL_Reg lib_whitedb_record_meta[] =
 	{ "record",     whitedb_record_new },
 	{ "del_recs",   whitedb_record_removec_records },
 	{ "print",      whitedb_record_print },
+
 	{ NULL, NULL }
 };
 
@@ -1285,9 +1285,9 @@ static const struct luaL_Reg lib_whitedb[] =
 //---------------------------------------------------------
 static const struct luaL_Reg lib_whitedb_meta[] =
 {
-	{ "create",			whitedb_record_create },
-	{ "delete",			whitedb_record_delete2 },
-	{ "records",		whitedb_records },
+	{ "create",	    whitedb_record_create },
+	{ "delete",	    whitedb_record_delete2 },
+	{ "records",	    whitedb_records },
 	{ "read_start",     whitedb_read_start },
 	{ "read_end",       whitedb_read_end   },
 	{ "write_start",    whitedb_write_start },
