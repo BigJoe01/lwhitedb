@@ -8,8 +8,7 @@ local whitedb = whitedb
 -- check whitedb attach
 	if whitedb.attach == nil then print( 'Whitedb attach is nil') return end
 
-    --5368709120
-local db = whitedb.attach( 'test', 1000000 , 0 )
+local db = whitedb.attach( 'test', 1024*1024, 0 )
 
 -- new whitedb
 	if db == nil then print( 'Whitedb new db is nil') return end
@@ -19,10 +18,10 @@ local db = whitedb.attach( 'test', 1000000 , 0 )
 local rec1count = 4
 local rec2count = 4
 
-local rec1 = db:create( rec1count  )
-local rec2 = db:create( rec2count  )
-local rec3 = db:create( rec2count  )
-local rec4 = db:create( rec2count  )
+local rec1 = db:record( rec1count  )
+local rec2 = db:record( rec2count  )
+local rec3 = db:record( rec2count  )
+
 print( ' record 1 created : ' .. rec1count )
 print( ' record 2 created : ' .. rec2count )
 
@@ -38,10 +37,6 @@ rec1:set( 2, 1 )
 rec1:set( 3, 3 )
 rec1:set( 4, 1 )
 
-print( ' Set record 1 field 2 ref to rec 4')
-print( '--------------------------------')
-rec1:rec_ref( 2, rec4 )
-db:print()
 
 print( ' Set record 2 fields')
 print( '--------------------------------')
@@ -55,7 +50,9 @@ print( '--------------------------------')
 rec3:set( 1, 'x3')
 rec3:set( 2, 2 )
 rec3:set( 3, 3 )
-rec3:set( 4, 3 )
+rec3:set( 4, '3' )
+
+
 
 local rec1_size = rec1:size()
 local rec2_size = rec2:size()
@@ -76,7 +73,7 @@ local new_rec = rec2:record( 2, 2 )
 print( 'field type ' .. rec2:type( 2 ) )
 
 print( 'set record')
-new_rec:set( 0, 'asdsad' )
+new_rec:set( 1, 'asdsad' )
 
 -- iterate over records
 print('Iterate records' )
@@ -110,24 +107,34 @@ print('\n')
 print( 'Create multi index')
 print( '--------------------------------')
 
-local multi = { [0] = {}, [1] = 2 }
-local success = db:index_m( 0, multi )
+local multi = { [1] = {}, [2] = 2 }
+local success = db:index_m( 1, multi )
 print(' Success : ' .. tostring( success ) )
 
 print('\n')
 print( 'Create single index on 1 field')
 print( '--------------------------------')
 
-success = db:index_s( 1 )
+success = db:index_s( 2 )
 print(' Success : ' .. tostring( success ) )
 
 print('\n')
 print( 'Create single index on 0 field')
 print( '--------------------------------')
 
-success = db:index_s( 0 )
+success = db:index_s( 1 )
 print(' Success : ' .. tostring( success ) )
 
+print('\n')
+print( 'Query sum')
+print( '--------------------------------')
+
+local query_data_sum = {
+    { column = 3, cond = '>', value = 1 },
+    { column = 3, cond = '<=', value = 4 },
+}
+local qcount, qsum = db:query_count_sum( query_data_sum, 3 )
+print(' count : ' .. qcount .. ' sum : ' .. qsum .. ' \n')
 
 
 print('\n')
@@ -145,9 +152,35 @@ for rec in db:query( query_data ) do
     rec:print()
 end
 
+print('\n')
+print( 'Query table')
+print( '--------------------------------')
+local qtable = db:query_t( query_data )
+for i = 1, #qtable do
+    local qt = qtable[i]
+    print('\n')
+    qt:print()
+end
 
 print('\n')
 
+
+print('\n')
+print( 'Query "3"')
+print( '--------------------------------')
+db:print()
+local query_data = {
+    { column = 4, cond = '=', value = '3' },
+}
+print('Data\n')
+local qtable2 = db:query_t( query_data )
+for i = 1, #qtable2 do
+    local qt = qtable2[i]
+    print('\n')
+    qt:print()
+end
+
+print('\n')
 
 print( 'Set table')
 print( '--------------------------------')
@@ -186,9 +219,5 @@ print( '--------------------------------')
 db:export_csv( 'c:\\temp\\db.csv' )
 
 print('\n')
-print( 'Clear database')
-print( '--------------------------------')
-db:clear()
-db:print()
 
 print('Whitedb test end')
